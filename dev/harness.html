@@ -1,0 +1,36 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body>
+<!-- 리스 없이 플러그인을 띄워 보는 모의 환경. 브라우저로 이 파일을 열면 가짜 봇·모듈 데이터로 Asset Drawer가 열린다. -->
+<script>
+window.__AD_TEST__=true;
+const emos=['joy','angry','sad','shy','surprised','sleepy','smug','pout','worried','proud','tease','calm'];
+const outfits=['casual','bikini','winter'];
+const pal=['#f4b6a6','#a6d1f4','#f4e3a6','#c6a6f4','#a6f4c9','#f4a6d7'];
+async function mk(label,i){const c=document.createElement('canvas');c.width=c.height=160;const x=c.getContext('2d');
+ if(i%5!==3){x.fillStyle=pal[i%pal.length];x.beginPath();x.arc(80,86,62,0,7);x.fill();}
+ x.fillStyle='#3a2a28';x.beginPath();x.arc(60,78,7,0,7);x.arc(100,78,7,0,7);x.fill();x.lineWidth=5;x.strokeStyle='#3a2a28';x.beginPath();x.arc(80,98,18,0.2,2.9);x.stroke();
+ x.font='bold 15px sans-serif';x.textAlign='center';x.fillText(label.slice(0,14),80,150);
+ return new Uint8Array(await (await new Promise(r=>c.toBlob(r))).arrayBuffer());}
+const store={};let n=0;
+const emotionImages=[],additionalAssets=[];
+outfits.forEach(o=>emos.forEach(e=>{const p='assets/'+(n++)+'.png';store[p]=o+'_'+e;emotionImages.push([o+'_'+e,p]);}));
+['bg_room','bg_beach','bg_snow','cg_kiss','bgm_main'].forEach(a=>{const p='assets/'+(n++)+'.png';store[p]=a;additionalAssets.push([a,p,a.startsWith('bgm')?'mp3':'png']);});
+const modAssets=[];['serena_casual','serena_smile','serena_cry','serena_dress'].forEach(a=>{const p='assets/'+(n++)+'.png';store[p]=a;modAssets.push([a,p,'png']);});
+const db={characters:[{chaId:'c1',name:'후유카',image:'assets/0.png',emotionImages,additionalAssets,chats:[]},{chaId:'c2',name:'세레나 테스트봇',image:'',emotionImages:[],additionalAssets:[],chats:[]}],
+ modules:[{id:'m1',name:'세레나 페르소나 에셋',assets:modAssets},{id:'m2',name:'후유카 겨울 의상',assets:[]}],enabledModules:['m1']};
+const ps={};let cb=null;const bytes={};let up=0;
+window.risuai={
+ pluginStorage:{keys:async()=>Object.keys(ps),getItem:async k=>ps[k]?JSON.parse(ps[k]):null,setItem:async(k,v)=>{ps[k]=JSON.stringify(v)}},
+ registerSetting:async(n,f)=>{cb=f;return{id:'s'}},registerButton:async()=>({id:'b'}),onUnload:async()=>{},
+ showContainer:async()=>{},hideContainer:async()=>{document.body.dataset.hidden=1},
+ getColorScheme:async()=>({name:'light',scheme:{type:window.__DARK__?'dark':'light'}}),
+ getDatabase:async()=>JSON.parse(JSON.stringify(db)),setDatabase:async d=>{Object.assign(db,JSON.parse(JSON.stringify(d)))},
+ getCurrentCharacterIndex:async()=>0,
+ getCharacterFromIndex:async i=>JSON.parse(JSON.stringify(db.characters[i])),setCharacterToIndex:async(i,c)=>{db.characters[i]=c},
+ saveAsset:async d=>{const p='assets/up'+(up++)+'.png';bytes[p]=new Uint8Array(d);return p;},
+ readImage:async p=>{if(bytes[p])return bytes[p];const l=store[p];if(!l)return null;if(l.startsWith('bgm'))return new Uint8Array([0x49,0x44,0x33,4,0,0]);return mk(l,+p.split('/')[1].split('.')[0]);},
+};
+window.__db=db;window.__ps=ps;
+</script>
+<script src="../asset_drawer.js"></script>
+<script>addEventListener("load",()=>setTimeout(()=>__AD_OPEN__(),50));</script>
+</body></html>
