@@ -28,7 +28,6 @@
   const clone = (v) => JSON.parse(JSON.stringify(v));
 
   const KIND = { emo: '감정', add: '추가', mod: '모듈' };
-  const COLORS = ['#e2694c', '#e3a33b', '#8fa857', '#3fa39a', '#4a8fd6', '#8a6fd8', '#d6609a', '#7a8494'];
 
   const P = {
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
@@ -108,7 +107,7 @@
   };
   const savePrefs = () => store.set('ad.prefs', S.prefs);
   const saveF = () => S.src && store.set('ad.f.' + S.src.key, S.fdata);
-  const normF = (d) => ({ folders: Array.isArray(d?.folders) ? d.folders : [], map: d?.map && typeof d.map === 'object' ? d.map : {}, collapsed: d?.collapsed && typeof d.collapsed === 'object' ? d.collapsed : {} });
+  const normF = (d) => tidyTree({ folders: Array.isArray(d?.folders) ? d.folders : [], map: d?.map && typeof d.map === 'object' ? d.map : {}, collapsed: d?.collapsed && typeof d.collapsed === 'object' ? d.collapsed : {} });
 
   // 예전 이름(asset_manager)으로 쓰던 폴더·설정을 가져오기.
   // 리스의 플러그인 저장소는 플러그인끼리 공유되므로 옛 키(am.*)를 그대로 읽을 수 있음.
@@ -194,9 +193,10 @@
     return p;
   }
 
+  // 나중에 요청한 것(지금 화면에 보이는 칸)부터 읽어서, 빠르게 스크롤해도 지나간 칸에 밀리지 않게 함.
   function pump() {
     while (active < 6 && queue.length) {
-      const job = queue.shift();
+      const job = queue.pop();
       active++;
       (async () => {
         let info = null;
@@ -213,7 +213,8 @@
               info = { url, mime, ext: mime.split('/')[1], kind: mime.split('/')[0] };
             } else if (raw && raw.length) {
               const sn = sniff(raw, job.hint);
-              info = { url: URL.createObjectURL(new Blob([raw], { type: sn.mime })), ...sn };
+              const blob = new Blob([raw], { type: sn.mime });
+              info = { url: URL.createObjectURL(blob), blob, ...sn };
             }
           }
         } catch (e) { console.warn('[asset_drawer] readImage', job.path, e); }
@@ -226,17 +227,74 @@
     }
   }
 
-  function clearMedia() {
-    for (const m of media.values()) if (m.url && m.url.startsWith('blob:')) URL.revokeObjectURL(m.url);
-    media.clear();
-    queue.length = 0;
+  // ---------------------------------------------------------------- thumbnails
+  // 원본(수 MB, 1000px 넘는 그림)을 칸에 그대로 넣으면 스크롤할 때마다 큰 그림을 디코딩·축소하느라 버벅임.
+  // 칸과 목록에는 줄인 사본을 쓰고, 원본은 크게 보기 · 내보내기에서만 씀.
+  const THUMB_PX = Math.round(260 * Math.min(globalThis.devicePixelRatio || 1, 2));
+  const thumbs = new Map();    // path -> 칸에 쓸 url (줄일 필요가 없으면 원본 url)
+  const tpending = new Map();
+  const tqueue = [];
+  let tactive = 0;
+
+  async function shrink(info) {
+    if (typeof createImageBitmap !== 'function' || /svg|gif/.test(info.mime)) return null;
+    const blob = info.blob || (/^(data|blob):/.test(info.url) ? await (await fetch(info.url)).blob() : null);
+    if (!blob) return null;
+    const bmp = await createImageBitmap(blob);
+    try {
+      const k = THUMB_PX / Math.max(bmp.width, bmp.height);
+      if (k >= 0.8) return null;
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.round(bmp.width * k));
+      cv.height = Math.max(1, Math.round(bmp.height * k));
+      const cx = cv.getContext('2d');
+      cx.imageSmoothingQuality = 'high';
+      cx.drawImage(bmp, 0, 0, cv.width, cv.height);
+      const out = await new Promise((r) => cv.toBlob(r, 'image/webp', 0.86));
+      return out ? URL.createObjectURL(out) : null;
+    } finally { bmp.close && bmp.close(); }
   }
 
-  function mediaHTML(info, name) {
+  function loadThumb(path, info) {
+    if (!info || info.kind !== 'image') return Promise.resolve(null);
+    if (thumbs.has(path)) return Promise.resolve(thumbs.get(path));
+    if (tpending.has(path)) return tpending.get(path);
+    const p = new Promise((res) => { tqueue.push({ path, info, res }); pumpThumb(); });
+    tpending.set(path, p);
+    return p;
+  }
+
+  function pumpThumb() {
+    while (tactive < 2 && tqueue.length) {
+      const job = tqueue.pop();
+      tactive++;
+      shrink(job.info).catch(() => null).then((url) => {
+        const u = url || job.info.url;
+        thumbs.set(job.path, u);
+        tpending.delete(job.path);
+        job.res(u);
+        tactive--;
+        pumpThumb();
+      });
+    }
+  }
+
+  // 원본 정보와 칸에 쓸 url을 함께 받기
+  const loadTile = (path, hint) => loadMedia(path, hint).then((info) => loadThumb(path, info).then((thumb) => ({ info, thumb })));
+
+  function clearMedia() {
+    for (const m of media.values()) if (m.url && m.url.startsWith('blob:')) URL.revokeObjectURL(m.url);
+    for (const [p, u] of thumbs) if (u.startsWith('blob:') && u !== (media.get(p) || {}).url) URL.revokeObjectURL(u);
+    media.clear(); thumbs.clear();
+    pending.clear(); tpending.clear();
+    queue.length = 0; tqueue.length = 0;
+  }
+
+  function mediaHTML(info, name, thumb) {
     if (!info) return `<div class="ph-ico" title="불러올 수 없음">${ic('image', 22)}</div>`;
     if (info.kind === 'video') return `<video src="${esc(info.url)}" muted loop playsinline preload="metadata"></video><span class="mbadge">${ic('eye', 12)}VIDEO</span>`;
     if (info.kind === 'audio') return `<div class="ph-ico audio">${ic('music', 26)}<span>${esc((info.ext || '').toUpperCase())}</span></div>`;
-    return `<img src="${esc(info.url)}" alt="${esc(name)}" draggable="false" decoding="async">`;
+    return `<img src="${esc(thumb || info.url)}" alt="${esc(name)}" draggable="false" decoding="async">`;
   }
 
   let io = null;
@@ -248,9 +306,9 @@
         if (!e.isIntersecting) continue;
         const el = e.target;
         io.unobserve(el);
-        loadMedia(el.dataset.path, el.dataset.hint).then((info) => {
+        loadTile(el.dataset.path, el.dataset.hint).then(({ info, thumb }) => {
           el.classList.remove('loading');
-          el.innerHTML = mediaHTML(info, el.dataset.name);
+          el.innerHTML = mediaHTML(info, el.dataset.name, thumb);
           const card = el.closest('[data-uid]');
           const extEl = card && card.querySelector('.ext[data-auto]');
           if (extEl && info) extEl.textContent = (info.ext || '').toUpperCase();
@@ -262,7 +320,7 @@
 
   function phHTML(a) {
     const info = media.get(a.path);
-    if (info) return `<div class="ph">${mediaHTML(info, a.name)}</div>`;
+    if (info && (info.kind !== 'image' || thumbs.has(a.path))) return `<div class="ph">${mediaHTML(info, a.name, thumbs.get(a.path))}</div>`;
     return `<div class="ph loading" data-path="${esc(a.path)}" data-hint="${esc(a.ext)}" data-name="${esc(a.name)}"></div>`;
   }
 
@@ -353,6 +411,31 @@
   // ---------------------------------------------------------------- derived
   const folderIds = () => new Set(S.fdata.folders.map((f) => f.id));
   function folderOf(a, ids = folderIds()) { const id = S.fdata.map[a.fkey]; return id && ids.has(id) ? id : null; }
+
+  // 폴더 나무: 최대 두 단계(폴더 → 하위 폴더). 하위 폴더는 parent에 위 폴더 id를 가짐.
+  // 부모가 사라졌거나 하위 폴더를 부모로 가리키면 최상위 폴더로 바로잡음.
+  function tidyTree(d) {
+    const by = new Map(d.folders.map((f) => [f.id, f]));
+    for (const f of d.folders) if (f.parent && (!by.has(f.parent) || f.parent === f.id)) delete f.parent;
+    for (const f of d.folders) if (f.parent && by.get(f.parent).parent) delete f.parent;
+    return d;
+  }
+  const fget = (id) => S.fdata.folders.find((f) => f.id === id);
+  const tops = () => S.fdata.folders.filter((f) => !f.parent);
+  const kids = (id) => S.fdata.folders.filter((f) => f.parent === id);
+  const treeOrder = () => tops().flatMap((f) => [f, ...kids(f.id)]);
+  const fullName = (f) => { const p = f && f.parent && fget(f.parent); return p ? `${p.name} / ${f.name}` : (f ? f.name : ''); };
+  // 에셋이 이 폴더(하위 폴더 포함) 안에 있는지
+  function within(a, fid, ids) { const f = folderOf(a, ids); return !!f && (f === fid || (fget(f) || {}).parent === fid); }
+  // 같은 무리(최상위끼리, 또는 같은 위 폴더의 하위 폴더끼리)의 순서만 ids 순서대로 바꿈
+  function reorderPeers(ids) {
+    const set = new Set(ids), by = new Map(S.fdata.folders.map((f) => [f.id, f]));
+    let k = 0;
+    const next = S.fdata.folders.map((f) => (set.has(f.id) ? by.get(ids[k++]) : f));
+    const changed = next.some((f, i) => f !== S.fdata.folders[i]);
+    S.fdata.folders = next;
+    return changed;
+  }
   const kindOk = (a) => S.kind === 'all' || a.kind === S.kind;
 
   function matcher() {
@@ -371,8 +454,7 @@
     return S.assets.filter((a) => {
       if (!kindOk(a) || !m(a)) return false;
       if (S.folder === 'all') return true;
-      const f = folderOf(a, ids);
-      return S.folder === 'none' ? !f : f === S.folder;
+      return within(a, S.folder, ids);
     });
   }
 
@@ -448,13 +530,12 @@ input,select{font:inherit;color:inherit}
 .side-h{display:flex;align-items:center;justify-content:space-between;padding:0 6px 8px 10px;font-size:11px;font-weight:750;color:var(--ink-3);letter-spacing:.08em}
 .mini{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;color:var(--ink-2)}
 .mini:hover{background:var(--surface-2);color:var(--ink)}
-.folder-list{overflow:auto;flex:1;display:flex;flex-direction:column;gap:1px}
+.folder-list{overflow:auto;flex:1;display:flex;flex-direction:column;gap:1px;position:relative}
 .fold{display:flex;align-items:center;gap:10px;width:100%;min-height:35px;padding:0 4px 0 10px;border-radius:10px;color:var(--ink-2);font-weight:580;cursor:pointer;text-align:left;transition:background .12s,box-shadow .12s}
 .fold:hover{background:var(--surface-2)}
 .fold.on{background:var(--surface);color:var(--ink);box-shadow:0 0 0 1px var(--line),0 1px 3px rgba(0,0,0,.05)}
 .fold.over,.grp.over{background:var(--accent-soft)!important;box-shadow:inset 0 0 0 1.5px var(--accent)!important}
 .fold .i{color:var(--ink-3)}
-.dot{width:11px;height:11px;border-radius:4px;background:var(--c);flex:none;box-shadow:inset 0 0 0 1px rgba(0,0,0,.08)}
 .fname{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .n{font-size:11.5px;color:var(--ink-3);font-variant-numeric:tabular-nums;padding-right:4px}
 .fmore{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;color:var(--ink-3);opacity:0;flex:none}
@@ -464,12 +545,27 @@ input,select{font:inherit;color:inherit}
 .fold-hint{font-size:11.5px;color:var(--ink-3);padding:10px 12px;line-height:1.5}
 .fold-hint.sm{display:flex;align-items:center;gap:5px;font-size:11px;padding:8px 10px 2px;opacity:.85}
 .fgrip{width:18px;height:26px;margin-left:-6px;margin-right:-4px;display:grid;place-items:center;color:var(--ink-3);cursor:grab;touch-action:none;opacity:0;transition:opacity .15s;flex:none}
-.fold:hover .fgrip,.fold.lifting .fgrip{opacity:1}
+.fold:hover .fgrip{opacity:1}
 @media (hover:none){.fgrip{opacity:.7}}
-.fold.lifting{background:var(--surface);box-shadow:0 0 0 1.5px var(--accent),var(--shadow);position:relative;z-index:2;cursor:grabbing}
-.fold.lifting .fgrip{cursor:grabbing;color:var(--accent)}
-.folder-list.sorting .fold:not(.lifting){transition:transform .15s}
+.fold.slot{background:var(--accent-soft)!important;box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--accent) 45%,transparent)!important}
+.slot>*{visibility:hidden}
+.tile.slot,.row.slot{background:var(--accent-soft);border:1.5px dashed color-mix(in srgb,var(--accent) 55%,transparent);box-shadow:none}
+.row.slot{border-width:1.5px 0}
+.dragsrc{display:none!important}
+.tile,.row{-webkit-touch-callout:none}
+.drag-ghost{position:fixed!important;z-index:90;margin:0;pointer-events:none;opacity:.75;box-shadow:0 0 0 1.5px var(--accent),var(--shadow-lg)!important;will-change:transform;transition:none!important;content-visibility:visible}
+.drag-ghost .tile-media{transform:none!important}
+.ghost-n{position:absolute;top:8px;right:8px;z-index:3;min-width:26px;height:26px;padding:0 8px;border-radius:13px;background:var(--accent);color:var(--accent-ink);font-weight:750;font-size:13px;display:grid;place-items:center;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+body.asset-dragging,body.asset-dragging *{cursor:grabbing!important}
+body.asset-dragging .tile:hover{box-shadow:none}
+body.asset-dragging .zoomb,body.asset-dragging .tick{opacity:0!important}
+.fold-ghost{position:fixed;z-index:90;margin:0;pointer-events:none;opacity:.72;background:var(--surface);color:var(--ink);box-shadow:0 0 0 1.5px var(--accent),var(--shadow-lg);will-change:transform}
+.fold-ghost .fgrip{opacity:1;color:var(--accent)}
+.fold-ghost .fmore{opacity:0}
+body.fold-dragging,body.fold-dragging *{cursor:grabbing!important}
+.folder-list.sorting .fold:hover{background:none}
 .folder-list.sorting{user-select:none;-webkit-user-select:none}
+.fold[data-fid]{user-select:none;-webkit-user-select:none}
 .side-foot{padding:8px 4px 0}
 .ghost{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;height:34px;border-radius:10px;border:1px dashed var(--line-strong);color:var(--ink-2);font-size:12.5px;font-weight:600}
 .ghost:hover{border-style:solid;color:var(--ink);background:var(--surface)}
@@ -508,9 +604,33 @@ input,select{font:inherit;color:inherit}
 .size{display:flex;align-items:center;gap:8px;height:38px;padding:0 12px;border-radius:11px;border:1px solid var(--line);background:var(--surface);color:var(--ink-3)}
 .size input{width:96px;accent-color:var(--accent)}
 
-.content{flex:1;overflow:auto;padding:0 24px 130px;overscroll-behavior:contain}
+.content{position:relative;flex:1;overflow:auto;padding:0 24px 130px;overscroll-behavior:contain}
 .grp{margin-bottom:14px;border-radius:18px;transition:background .15s,box-shadow .15s;padding:0 2px 6px}
-.grp-h{position:sticky;top:0;z-index:3;display:flex;align-items:center;gap:9px;padding:10px 6px 10px 2px;background:var(--bg)}
+.grp-h{position:sticky;top:0;z-index:3;display:flex;align-items:center;gap:9px;padding:10px 6px 10px 2px;background:var(--grp-bg,var(--bg));cursor:pointer;user-select:none;-webkit-user-select:none}
+.grp.boxed{--grp-bg:color-mix(in srgb,var(--surface) 55%,var(--bg));background:var(--grp-bg);border:1px solid var(--line);padding:0 12px 12px}
+.grp.boxed>.grp-h{margin:0 -12px;padding:10px 12px 10px 8px;border-radius:17px 17px 0 0}
+.grp.boxed.collapsed{padding-bottom:0}
+.grp.boxed.collapsed>.grp-h{border-radius:17px}
+.grp-sorting>.grp.boxed>:not(.grp-h){display:none}
+.grp-sorting>.grp.boxed{padding-bottom:0}
+.grp-sorting>.grp.boxed>.grp-h{position:static;border-radius:17px}
+.grp-sorting>.grp.boxed>.grp-h .grp-tg{transform:rotate(-90deg)}
+.subs{display:flex;flex-direction:column;gap:10px}
+.grp>.grid+.subs,.grp>.list+.subs{margin-top:14px}
+.grp.boxed.sub{--grp-bg:var(--surface);margin-bottom:0}
+.grp.sub>.grp-h{position:static}
+.fold.sub{padding-left:28px}
+.fold.sub .fgrip{margin-left:-24px;margin-right:6px}
+.folder-list.tops-only .fold.sub{display:none}
+.mi.sub{padding-left:30px}
+.grp.boxed.slot{background:var(--accent-soft);border:1.5px dashed color-mix(in srgb,var(--accent) 55%,transparent)}
+.grp.boxed.slot>.grp-h{background:transparent}
+.grp-ghost{position:fixed!important;z-index:90;margin:0!important;pointer-events:none;opacity:.78;box-shadow:0 0 0 1.5px var(--accent),var(--shadow-lg);will-change:transform}
+.grp-ghost>.grp-h{position:static;border-radius:17px}
+.grp-ghost .grp-tg{transform:rotate(-90deg)}
+.grp-h:hover .grp-tg{background:var(--surface-2);color:var(--ink)}
+.grp.solo>.grp-h{cursor:default;padding-left:4px}
+.grp.solo .grp-name{font-size:16px}
 .grp-tg{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;color:var(--ink-3);transition:transform .18s}
 .grp-tg:hover{background:var(--surface-2);color:var(--ink)}
 .grp.collapsed .grp-tg{transform:rotate(-90deg)}
@@ -522,7 +642,7 @@ input,select{font:inherit;color:inherit}
 .grp-empty{border:1.5px dashed var(--line-strong);border-radius:14px;padding:22px;text-align:center;color:var(--ink-3);font-size:12.5px;display:flex;align-items:center;justify-content:center;gap:8px}
 
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--thumb,136px),1fr));gap:12px}
-.tile{position:relative;border-radius:15px;background:var(--surface);border:1px solid var(--line);overflow:hidden;cursor:pointer;user-select:none;-webkit-user-select:none;transition:border-color .15s,box-shadow .18s,background .15s;contain:layout paint}
+.tile{position:relative;border-radius:15px;background:var(--surface);border:1px solid var(--line);overflow:hidden;cursor:pointer;user-select:none;-webkit-user-select:none;transition:border-color .15s,box-shadow .18s,background .15s;contain:layout paint;content-visibility:auto;contain-intrinsic-size:auto calc(var(--thumb,136px) + 38px)}
 .tile:hover{border-color:var(--line-strong);box-shadow:var(--shadow)}
 .tile-media{aspect-ratio:1;position:relative;overflow:hidden;background:repeating-conic-gradient(var(--chk-b) 0 25%,var(--chk-a) 0 50%) 0 0/16px 16px;transition:transform .2s cubic-bezier(.2,.8,.2,1),border-radius .2s}
 .ph{position:absolute;inset:0}
@@ -532,9 +652,9 @@ input,select{font:inherit;color:inherit}
 .ph-ico{position:absolute;inset:0;display:grid;place-content:center;justify-items:center;gap:6px;color:var(--ink-3);font:700 10.5px 'JetBrains Mono',monospace}
 .ph-ico.audio{color:var(--accent)}
 .mbadge{position:absolute;bottom:7px;left:7px;display:flex;gap:4px;align-items:center;font:700 9.5px 'JetBrains Mono',monospace;color:#fff;background:rgba(0,0,0,.5);padding:2px 6px;border-radius:6px}
-.tick{position:absolute;top:8px;right:8px;width:24px;height:24px;border-radius:50%;border:1.6px solid rgba(255,255,255,.95);background:rgba(20,18,16,.22);display:grid;place-items:center;color:transparent;opacity:0;transition:opacity .15s,background .15s,transform .15s;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);z-index:2;box-shadow:0 1px 4px rgba(0,0,0,.2)}
+.tick{position:absolute;top:8px;right:8px;width:24px;height:24px;border-radius:50%;border:1.6px solid rgba(255,255,255,.95);background:rgba(20,18,16,.32);display:grid;place-items:center;color:transparent;opacity:0;transition:opacity .15s,background .15s,transform .15s;z-index:2;box-shadow:0 1px 4px rgba(0,0,0,.2)}
 .tile:hover .tick{opacity:1}
-.zoomb{position:absolute;right:7px;bottom:7px;width:28px;height:28px;border-radius:9px;display:grid;place-items:center;background:rgba(20,18,16,.55);color:#fff;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);opacity:0;transform:translateY(3px);transition:opacity .15s,transform .15s;z-index:2}
+.zoomb{position:absolute;right:7px;bottom:7px;width:28px;height:28px;border-radius:9px;display:grid;place-items:center;background:rgba(20,18,16,.66);color:#fff;opacity:0;transform:translateY(3px);transition:opacity .15s,transform .15s;z-index:2}
 .zoomb:hover{background:var(--accent);color:var(--accent-ink)}
 .tile:hover .zoomb,.row:hover .zoomb{opacity:1;transform:none}
 .row-th .zoomb{inset:0;width:auto;height:auto;border-radius:0;background:rgba(20,18,16,.45)}
@@ -543,17 +663,16 @@ input,select{font:inherit;color:inherit}
 .tile.sel .tile-media{transform:scale(.86);border-radius:11px;box-shadow:0 6px 16px -8px rgba(0,0,0,.35)}
 .tile.sel .tick,.row.sel .tick{opacity:1;background:var(--accent);border-color:var(--accent);color:var(--accent-ink);transform:scale(1.04)}
 .kbadge{font-size:10px;font-weight:750;padding:2px 7px;border-radius:999px;letter-spacing:.02em;white-space:nowrap}
-.tile .kbadge{position:absolute;top:9px;left:9px;background:rgba(20,18,16,.55);color:#fff;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);z-index:2}
+.tile .kbadge{position:absolute;top:9px;left:9px;background:rgba(20,18,16,.66);color:#fff;z-index:2}
 .kbadge.k-emo{--k:#e3a33b}.kbadge.k-add{--k:#4a8fd6}.kbadge.k-mod{--k:#8a6fd8}
 .tile .kbadge::before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--k);margin-right:5px;vertical-align:1px}
 .tile-cap{display:flex;align-items:center;gap:7px;padding:8px 10px 9px;border-top:1px solid var(--line);min-height:36px}
 .tile.sel .tile-cap{border-top-color:transparent}
 .tile-name{flex:1;min-width:0;font-size:12.5px;font-weight:620;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tile .fdot{width:8px;height:8px;border-radius:3px;background:var(--c);flex:none}
 .hl{background:var(--accent-soft);color:var(--accent);border-radius:3px;padding:0 1px}
 
 .list{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:15px;overflow:hidden;background:var(--surface)}
-.row{display:grid;grid-template-columns:24px 46px minmax(0,1fr) auto auto minmax(0,150px);align-items:center;gap:14px;padding:8px 16px 8px 14px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;-webkit-user-select:none;position:relative;transition:background .12s}
+.row{display:grid;grid-template-columns:24px 46px minmax(0,1fr) auto auto minmax(0,150px);align-items:center;gap:14px;padding:8px 16px 8px 14px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;-webkit-user-select:none;position:relative;transition:background .12s;content-visibility:auto;contain-intrinsic-size:auto 63px}
 .row:last-child{border-bottom:0}
 .row:hover{background:var(--surface-2)}
 .row.sel{background:var(--accent-soft)}
@@ -614,10 +733,6 @@ input,select{font:inherit;color:inherit}
 .input,.select{width:100%;height:40px;padding:0 12px;border-radius:11px;border:1px solid var(--line);background:var(--bg);outline:0;transition:border-color .15s,box-shadow .15s}
 .input:focus,.select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.swatches{display:flex;gap:9px;flex-wrap:wrap}
-.sw{width:30px;height:30px;border-radius:10px;background:var(--c);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1);transition:transform .12s}
-.sw:hover{transform:translateY(-1px)}
-.sw.on{box-shadow:0 0 0 2px var(--surface),0 0 0 4px var(--c)}
 .check{display:flex;align-items:center;gap:10px;font-size:13px;cursor:pointer;color:var(--ink-2)}
 .check input{accent-color:var(--accent);width:17px;height:17px;flex:none}
 .check b{color:var(--ink);font-weight:620}
@@ -654,7 +769,6 @@ input,select{font:inherit;color:inherit}
 .lb-edit:hover{background:rgba(255,255,255,.12);color:#f3f0ea}
 .lb-input{font-size:16px;font-weight:720;font-family:inherit;letter-spacing:-.02em;color:#f3f0ea;background:rgba(255,255,255,.08);border:1.5px solid var(--accent);border-radius:9px;padding:3px 10px;outline:0;width:min(420px,100%)}
 .lb-meta span{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:rgba(243,240,234,.6);margin-top:3px}
-.lb-meta .dot{width:9px;height:9px}
 .lb-btn{height:38px;padding:0 14px;border-radius:11px;display:inline-flex;align-items:center;gap:7px;font-weight:650;font-size:13px;background:rgba(255,255,255,.1);color:#f3f0ea}
 .lb-btn:hover{background:rgba(255,255,255,.18)}
 .lb-btn.on{background:var(--accent);color:var(--accent-ink)}
@@ -807,7 +921,7 @@ input,select{font:inherit;color:inherit}
       </button>`).join('');
     $$('[data-av]', el).forEach((av) => {
       const p = av.dataset.av;
-      loadMedia(p).then((info) => { if (info && info.kind === 'image') av.innerHTML = `<img src="${esc(info.url)}" alt="">`; });
+      loadTile(p).then(({ thumb }) => { if (thumb) av.innerHTML = `<img src="${esc(thumb)}" alt="">`; });
     });
   }
 
@@ -818,25 +932,28 @@ input,select{font:inherit;color:inherit}
     if (!S.src) { el.innerHTML = `<div class="fold-hint">봇이나 모듈을 고르면 폴더를 만들 수 있어요.</div>`; return; }
     const ids = folderIds();
     const base = S.assets.filter(kindOk);
-    const cnt = {}; let un = 0;
-    for (const a of base) { const f = folderOf(a, ids); if (f) cnt[f] = (cnt[f] || 0) + 1; else un++; }
+    const cnt = {};
+    for (const a of base) {
+      const f = folderOf(a, ids); if (!f) continue;
+      cnt[f] = (cnt[f] || 0) + 1;
+      const p = fget(f).parent; if (p) cnt[p] = (cnt[p] || 0) + 1;
+    }
     el.innerHTML = `
       <button class="fold ${S.folder === 'all' ? 'on' : ''}" data-folder="all">${ic('layers', 16)}<span class="fname">전체</span><span class="n">${base.length}</span></button>
-      <button class="fold ${S.folder === 'none' ? 'on' : ''}" data-folder="none" data-drop="none">${ic('folderOut', 16)}<span class="fname">폴더 밖</span><span class="n">${un}</span></button>
-      ${S.fdata.folders.map((f) => `
-        <div class="fold ${S.folder === f.id ? 'on' : ''}" data-folder="${f.id}" data-drop="${f.id}" data-fid="${f.id}" role="button" tabindex="0">
+      ${treeOrder().map((f) => `
+        <div class="fold ${f.parent ? 'sub' : ''} ${S.folder === f.id ? 'on' : ''}" data-folder="${f.id}" data-drop="${f.id}" data-fid="${f.id}" ${f.parent ? `data-parent="${f.parent}"` : ''} role="button" tabindex="0">
           <span class="fgrip" data-grip="${f.id}" title="끌어서 순서 바꾸기">${ic('grip', 16)}</span>
-          <span class="dot" style="--c:${esc(f.color)}"></span><span class="fname">${esc(f.name)}</span><span class="n">${cnt[f.id] || 0}</span>
+          ${ic('folder', 16)}<span class="fname">${esc(f.name)}</span><span class="n">${cnt[f.id] || 0}</span>
           <button class="fmore" data-fedit="${f.id}" title="폴더 편집">${ic('more', 16)}</button>
         </div>`).join('')}
       ${S.fdata.folders.length ? '' : `<div class="fold-hint">에셋을 골라 폴더로 묶어 보세요. 타일을 여기로 끌어다 놓아도 돼요.</div>`}
-      ${S.fdata.folders.length > 1 ? `<div class="fold-hint sm">${ic('grip', 13)}손잡이를 끌어서 폴더 순서를 바꿀 수 있어요</div>` : ''}`;
+      ${S.fdata.folders.length > 1 ? `<div class="fold-hint sm">${ic('grip', 13)}폴더를 끌어서 순서를 바꿀 수 있어요</div>` : ''}`;
   }
 
   function renderTop() {
     const src = S.src;
     $('#srcTitle').textContent = src ? src.name : 'Asset Drawer';
-    $('#crumb').innerHTML = src ? `${src.type === 'char' ? ic('user', 13) + '봇' : ic('box', 13) + '모듈'}${S.folder !== 'all' ? ` <span>›</span> ${esc(S.folder === 'none' ? '폴더 밖' : (S.fdata.folders.find((f) => f.id === S.folder) || {}).name || '')}` : ''}` : '봇 · 모듈 에셋 관리';
+    $('#crumb').innerHTML = src ? `${src.type === 'char' ? ic('user', 13) + '봇' : ic('box', 13) + '모듈'}${S.folder !== 'all' ? ` <span>›</span> ${esc(fullName(fget(S.folder))).replace(' / ', ' <span>›</span> ')}` : ''}` : '봇 · 모듈 에셋 관리';
     const base = S.assets.filter(kindOk);
     $('#stats').innerHTML = src ? `
       <span class="stat">에셋 <b>${base.length}</b></span>
@@ -906,20 +1023,23 @@ input,select{font:inherit;color:inherit}
     }
     const vis = visibleAssets();
     const ids = folderIds();
+    const hasQ = !!S.query.trim();
+    // 묶음 하나 = 폴더에 바로 든 에셋 + 하위 폴더 묶음들
+    const node = (f) => {
+      const items = vis.filter((a) => folderOf(a, ids) === f.id);
+      const subs = f.parent ? [] : kids(f.id).map(node).filter((n) => n.total || !hasQ);
+      return { id: f.id, f, items, subs, total: items.length + subs.reduce((t, n) => t + n.total, 0) };
+    };
+    const solo = S.folder !== 'all';
     const groups = [];
-    if (S.folder === 'all') {
-      const hasQ = !!S.query.trim();
-      for (const f of S.fdata.folders) {
-        const items = vis.filter((a) => folderOf(a, ids) === f.id);
-        if (items.length || !hasQ) groups.push({ id: f.id, f, items });
-      }
+    if (!solo) {
+      // 폴더에 넣지 않은 에셋을 맨 위에, 그 아래로 폴더별 묶음
       const un = vis.filter((a) => !folderOf(a, ids));
-      if (un.length || !S.fdata.folders.length || !hasQ) groups.push({ id: 'none', f: null, items: un, bare: !S.fdata.folders.length });
-    } else if (S.folder === 'none') {
-      groups.push({ id: 'none', f: null, items: vis });
+      if (un.length || !S.fdata.folders.length) groups.push({ id: 'none', f: null, items: un, subs: [], total: un.length, bare: !S.fdata.folders.length });
+      for (const f of tops()) { const n = node(f); if (n.total || !hasQ) groups.push(n); }
     } else {
-      const f = S.fdata.folders.find((x) => x.id === S.folder);
-      groups.push({ id: S.folder, f, items: vis });
+      const f = fget(S.folder);
+      groups.push(f ? node(f) : { id: S.folder, f: null, items: vis, subs: [], total: vis.length });
     }
     if (!vis.length && S.query.trim()) {
       el.innerHTML = `<div class="empty"><div><div class="art">${ic('search', 30)}</div><h3>‘${esc(S.query.trim())}’와 일치하는 에셋이 없어요</h3><p>다른 키워드로 찾아보거나 /정규식/ 으로 검색해 보세요.</p></div></div>`;
@@ -928,51 +1048,52 @@ input,select{font:inherit;color:inherit}
     }
     S.order = []; S.groups = {};
     const isChar = S.src.type === 'char';
-    const html = groups.map((g) => {
-      S.groups[g.id] = g.items.map((a) => a.uid);
-      const col = !!S.fdata.collapsed[g.id] && !g.bare;
-      if (!col) S.order.push(...g.items.map((a) => a.uid));
-      const allSel = g.items.length && g.items.every((a) => S.sel.has(a.uid));
-      const head = g.bare ? '' : `
-        <div class="grp-h">
-          <button class="grp-tg" data-collapse="${g.id}" title="접기/펼치기">${ic('chevD', 16)}</button>
-          ${g.f ? `<span class="dot" style="--c:${esc(g.f.color)}"></span>` : `<span style="color:var(--ink-3)">${ic('folderOut', 16)}</span>`}
-          <span class="grp-name">${esc(g.f ? g.f.name : '폴더 밖')}</span><span class="grp-n">${g.items.length}</span>
-          <span class="grow"></span>
-          ${g.items.length ? `<button class="grp-sel ${allSel ? 'on' : ''}" data-selgrp="${g.id}">${allSel ? ic('check', 14) + '모두 선택됨' : '모두 선택'}</button>` : ''}
-          ${g.f ? `<button class="mini" data-fedit="${g.f.id}" title="폴더 편집">${ic('more', 16)}</button>` : ''}
-        </div>`;
-      let body = '';
-      if (!col) {
-        if (!g.items.length) body = `<div class="grp-empty">${ic('drop', 16)}에셋을 이 폴더로 끌어다 놓거나, 선택 후 ‘폴더로’를 눌러 주세요</div>`;
-        else if (S.prefs.view === 'grid') {
-          body = `<div class="grid">${g.items.map((a) => {
-            const fid = folderOf(a, ids); const f = fid && S.fdata.folders.find((x) => x.id === fid);
-            return `<div class="tile ${S.sel.has(a.uid) ? 'sel' : ''}" data-uid="${a.uid}" draggable="true" title="${esc(a.name)}">
+    const tileHTML = (a) => `<div class="tile ${S.sel.has(a.uid) ? 'sel' : ''}" data-uid="${a.uid}" title="${esc(a.name)}">
               <div class="tile-media">${phHTML(a)}<button class="zoomb" data-zoom="${a.uid}" title="크게 보기">${ic('zoom', 14)}</button></div>
               <span class="tick">${ic('check', 14)}</span>
               ${isChar ? `<span class="kbadge k-${a.kind}">${KIND[a.kind]}</span>` : ''}
-              <div class="tile-cap"><span class="tile-name">${hlName(a.name)}</span>${f && S.folder === 'all' && g.id !== fid ? `<span class="fdot" style="--c:${esc(f.color)}"></span>` : ''}</div>
+              <div class="tile-cap"><span class="tile-name">${hlName(a.name)}</span></div>
             </div>`;
-          }).join('')}</div>`;
-        } else {
-          body = `<div class="list">${g.items.map((a) => {
-            const fid = folderOf(a, ids); const f = fid && S.fdata.folders.find((x) => x.id === fid);
-            const info = media.get(a.path);
-            const ext = (a.ext || (info && info.ext) || '').toUpperCase();
-            return `<div class="row ${S.sel.has(a.uid) ? 'sel' : ''}" data-uid="${a.uid}" draggable="true">
+    const rowHTML = (a) => {
+      const fid = folderOf(a, ids); const f = fid && fget(fid);
+      const info = media.get(a.path);
+      const ext = (a.ext || (info && info.ext) || '').toUpperCase();
+      return `<div class="row ${S.sel.has(a.uid) ? 'sel' : ''}" data-uid="${a.uid}">
               <span class="tick">${ic('check', 12)}</span>
               <div class="row-th">${phHTML(a)}<button class="zoomb" data-zoom="${a.uid}" title="크게 보기">${ic('zoom', 13)}</button></div>
               <div style="min-width:0"><div class="row-name">${hlName(a.name)}</div><div class="row-sub mono">${esc(a.path)}</div></div>
               ${isChar ? `<span class="kbadge k-${a.kind}">${KIND[a.kind]}</span>` : '<span></span>'}
               <span class="ext" ${a.ext ? '' : 'data-auto'}>${esc(ext || '···')}</span>
-              ${f ? `<span class="fchip"><span class="dot" style="--c:${esc(f.color)}"></span><span>${esc(f.name)}</span></span>` : `<span class="fchip none"><span>—</span></span>`}
+              ${f ? `<span class="fchip">${ic('folder', 14)}<span>${esc(fullName(f))}</span></span>` : `<span class="fchip none"><span>—</span></span>`}
             </div>`;
-          }).join('')}</div>`;
-        }
+    };
+    const allOf = (g) => [...g.items, ...g.subs.flatMap(allOf)];
+    // root: 폴더 하나를 열었을 때의 맨 바깥 묶음 — 접지 않고 늘 펼침
+    const sec = (g, root) => {
+      const uids = allOf(g).map((a) => a.uid);
+      S.groups[g.id] = uids;
+      const col = !root && !g.bare && !!S.fdata.collapsed[g.id];
+      if (!col) S.order.push(...g.items.map((a) => a.uid));
+      const allSel = uids.length && uids.every((u) => S.sel.has(u));
+      const head = g.bare ? '' : `
+        <div class="grp-h">
+          ${root ? '' : `<button class="grp-tg" data-collapse="${g.id}" title="접기/펼치기">${ic('chevD', 16)}</button>`}
+          <span style="color:var(--ink-3)">${ic(g.f ? 'folder' : 'folderOut', 16)}</span>
+          <span class="grp-name">${esc(g.f ? g.f.name : '폴더 밖')}</span><span class="grp-n">${g.total}</span>
+          <span class="grow"></span>
+          ${uids.length ? `<button class="grp-sel ${allSel ? 'on' : ''}" data-selgrp="${g.id}">${allSel ? ic('check', 14) + '모두 선택됨' : '모두 선택'}</button>` : ''}
+          ${g.f ? `<button class="mini" data-fedit="${g.f.id}" title="폴더 편집">${ic('more', 16)}</button>` : ''}
+        </div>`;
+      let body = '';
+      if (!col) {
+        if (g.items.length) body += S.prefs.view === 'grid' ? `<div class="grid">${g.items.map(tileHTML).join('')}</div>` : `<div class="list">${g.items.map(rowHTML).join('')}</div>`;
+        else if (!g.subs.length) body += `<div class="grp-empty">${ic('drop', 16)}에셋을 이 폴더로 끌어다 놓거나, 선택 후 ‘폴더로’를 눌러 주세요</div>`;
+        if (g.subs.length) body += `<div class="subs">${g.subs.map((n) => sec(n, false)).join('')}</div>`;
       }
-      return `<section class="grp ${col ? 'collapsed' : ''}" data-drop="${g.id}">${head}${body}</section>`;
-    }).join('');
+      const cls = ['grp', g.f && !root ? 'boxed' : '', g.f && g.f.parent && !root ? 'sub' : '', col ? 'collapsed' : '', root ? 'solo' : ''].filter(Boolean).join(' ');
+      return `<section class="${cls}" data-drop="${g.id}">${head}${body}</section>`;
+    };
+    const html = groups.map((g) => sec(g, solo)).join('');
     el.innerHTML = html;
     hydrate(el);
   }
@@ -1090,67 +1211,79 @@ input,select{font:inherit;color:inherit}
   }
 
   // ---------------------------------------------------------------- folders
-  const swatchHTML = (cur) => `<div class="swatches">${COLORS.map((c) => `<button class="sw ${c === cur ? 'on' : ''}" data-color="${c}" style="--c:${c}" title="${c}"></button>`).join('')}</div>`;
-  function bindSwatches(m, get, set) {
-    m.querySelectorAll('[data-color]').forEach((b) => b.addEventListener('click', () => { set(b.dataset.color); m.querySelectorAll('[data-color]').forEach((x) => x.classList.toggle('on', x.dataset.color === get())); }));
-  }
+
+  // 폴더 위치 고르기: 최상위, 또는 최상위 폴더 안(하위 폴더)
+  const parentPick = (cur, self, locked) => {
+    const opts = tops().filter((t) => t.id !== self);
+    if (!opts.length && !cur) return '';
+    return `<div><label class="lbl">위치</label><select class="select" id="fParent" ${locked ? 'disabled' : ''}>
+      <option value="">최상위 폴더</option>
+      ${opts.map((t) => `<option value="${t.id}" ${t.id === cur ? 'selected' : ''}>‘${esc(t.name)}’ 안 (하위 폴더)</option>`).join('')}
+    </select>${locked ? '<p class="help">하위 폴더가 있는 폴더는 다른 폴더 안으로 넣을 수 없어요.</p>' : ''}</div>`;
+  };
 
   async function createFolder(withUids) {
     if (!S.src) return;
-    let color = COLORS[S.fdata.folders.length % COLORS.length];
+    // 폴더 하나를 열어 둔 상태면 그 폴더(하위 폴더면 그 위 폴더) 안에 만드는 것을 기본으로
+    const cur = S.folder !== 'all' && fget(S.folder);
+    const defParent = cur ? (cur.parent || cur.id) : '';
     const n = withUids ? withUids.length : 0;
     const res = await modal({
       icon: 'folderPlus', title: '새 폴더', desc: n ? `선택한 에셋 ${n}개를 이 폴더에 바로 넣을게요.` : '이 ' + (S.src.type === 'char' ? '봇' : '모듈') + '에서만 쓰는 폴더예요.',
-      body: `<div><label class="lbl">이름</label><input class="input" id="fName" placeholder="예: 겨울 의상" maxlength="40"></div>
-             <div><label class="lbl">색상</label>${swatchHTML(color)}</div>`,
+      body: `<div><label class="lbl">이름</label><input class="input" id="fName" placeholder="예: 겨울 의상" maxlength="40"></div>${parentPick(defParent)}`,
       ok: '만들기',
-      onMount: (m) => bindSwatches(m, () => color, (c) => (color = c)),
       onOk: (m) => {
         const name = m.querySelector('#fName').value.trim();
         if (!name) { m.querySelector('#fName').focus(); return false; }
-        return { name };
+        return { name, parent: m.querySelector('#fParent')?.value || '' };
       },
     });
     if (!res) return null;
-    const f = { id: rid(), name: res.name, color };
+    const f = { id: rid(), name: res.name };
+    if (res.parent && fget(res.parent)) f.parent = res.parent;
     S.fdata.folders.push(f);
     if (withUids && withUids.length) { assignFolder(withUids, f.id, true); S.sel.clear(); }
     await saveF();
     renderAll();
-    toast(`‘${f.name}’ 폴더를 만들었어요`);
+    toast(`‘${fullName(f)}’ 폴더를 만들었어요`);
     return f;
   }
 
   async function editFolder(id) {
     const f = S.fdata.folders.find((x) => x.id === id);
     if (!f) return;
-    let color = f.color;
     const res = await modal({
-      icon: 'folder', title: '폴더 편집', desc: '폴더를 지워도 안에 있던 에셋은 지워지지 않고 폴더 밖으로 나와요. 순서는 사이드바에서 손잡이를 끌어 바꿀 수 있어요.',
-      body: `<div><label class="lbl">이름</label><input class="input" id="fName" value="${esc(f.name)}" maxlength="40"></div>
-             <div><label class="lbl">색상</label>${swatchHTML(color)}</div>`,
+      icon: 'folder', title: '폴더 편집',
+      desc: f.parent ? '하위 폴더를 지우면 안에 있던 에셋은 위 폴더로 옮겨져요. 에셋 자체는 지워지지 않아요.'
+        : kids(f.id).length ? '폴더를 지우면 바로 들어 있던 에셋은 폴더 밖으로 나오고, 하위 폴더는 최상위 폴더가 돼요. 에셋 자체는 지워지지 않아요.'
+        : '폴더를 지워도 안에 있던 에셋은 지워지지 않고 폴더 밖으로 나와요. 순서는 폴더를 끌어서 바꿀 수 있어요.',
+      body: `<div><label class="lbl">이름</label><input class="input" id="fName" value="${esc(f.name)}" maxlength="40"></div>${parentPick(f.parent || '', f.id, kids(f.id).length > 0)}`,
       extra: `<button class="btn danger" data-del>${ic('trash', 15)}폴더 삭제</button>`,
       ok: '저장',
       onMount: (m, okBtn, done) => {
-        bindSwatches(m, () => color, (c) => (color = c));
         m.querySelector('[data-del]').addEventListener('click', () => done('delete'));
       },
       onOk: (m) => {
         const name = m.querySelector('#fName').value.trim();
         if (!name) return false;
-        return { name };
+        const sel = m.querySelector('#fParent');
+        return { name, parent: sel && !sel.disabled ? sel.value : null };
       },
     });
     if (res === 'delete') {
+      const up = f.parent && fget(f.parent) ? f.parent : null;
       S.fdata.folders = S.fdata.folders.filter((x) => x.id !== id);
-      for (const k of Object.keys(S.fdata.map)) if (S.fdata.map[k] === id) delete S.fdata.map[k];
+      for (const x of S.fdata.folders) if (x.parent === id) delete x.parent;
+      for (const k of Object.keys(S.fdata.map)) if (S.fdata.map[k] === id) { if (up) S.fdata.map[k] = up; else delete S.fdata.map[k]; }
       delete S.fdata.collapsed[id];
-      if (S.folder === id) S.folder = 'all';
+      if (S.folder === id) S.folder = up || 'all';
       await saveF(); renderAll(); toast(`‘${f.name}’ 폴더를 지웠어요`);
       return;
     }
     if (!res) return;
-    f.name = res.name; f.color = color;
+    f.name = res.name;
+    if (res.parent !== null) { if (res.parent && res.parent !== f.id && fget(res.parent)) f.parent = res.parent; else delete f.parent; }
+    tidyTree(S.fdata);
     await saveF(); renderAll();
   }
 
@@ -1162,51 +1295,107 @@ input,select{font:inherit;color:inherit}
     saveF();
     renderAll();
     const f = S.fdata.folders.find((x) => x.id === fid);
-    toast(fid === 'none' ? `${assets.length}개를 폴더 밖으로 뺐어요` : `${assets.length}개를 ‘${f ? f.name : ''}’로 옮겼어요`);
+    toast(fid === 'none' ? `${assets.length}개를 폴더 밖으로 뺐어요` : `${assets.length}개를 ‘${fullName(f)}’로 옮겼어요`);
   }
 
-  // 사이드바 폴더 순서: 손잡이를 끌어서 정렬 (마우스·터치 공통 포인터 이벤트)
+  // 사이드바 폴더 순서: 끌어서 정렬 (마우스는 줄 전체, 터치는 손잡이)
+  // 끄는 동안 반투명한 사본이 포인터를 따라오고, 원래 줄은 빈 자리가 되어 들어갈 위치를 보여 줌.
   function bindFolderSort() {
     const list = $('#folderList');
     let st = null;
-    list.addEventListener('pointerdown', (e) => {
-      const grip = e.target.closest('[data-grip]');
-      if (!grip || e.button > 0) return;
-      e.preventDefault();
-      const item = grip.closest('.fold');
-      st = { item, pid: e.pointerId };
-      try { item.setPointerCapture(e.pointerId); } catch {}
-      item.classList.add('lifting');
+    let settling = false;
+    let swallowClick = false;
+    const folds = () => $$('.fold[data-fid]', list);
+    // 줄이 자리를 옮길 때 원래 위치에서 새 위치로 미끄러지듯 움직이게 함
+    const slide = (els, tops) => {
+      for (const el of els) {
+        const d = tops.get(el) - el.offsetTop;
+        if (!d) continue;
+        el.style.transition = 'none';
+        el.style.transform = `translateY(${d}px)`;
+        el.getBoundingClientRect();
+        el.style.transition = 'transform .18s cubic-bezier(.2,.8,.2,1)';
+        el.style.transform = '';
+      }
+    };
+    const lift = (e) => {
+      const r = st.item.getBoundingClientRect();
+      const g = st.item.cloneNode(true);
+      g.classList.add('fold-ghost');
+      g.classList.remove('on');
+      g.removeAttribute('data-fid'); g.removeAttribute('data-drop'); g.removeAttribute('data-folder');
+      Object.assign(g.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+      document.body.appendChild(g);
+      st.on = true; st.ghost = g; st.dx = e.clientX - r.left; st.dy = e.clientY - r.top;
+      try { list.setPointerCapture(e.pointerId); } catch {}
+      st.item.classList.add('slot');
       list.classList.add('sorting');
+      // 최상위 폴더를 끄는 동안에는 하위 폴더 줄을 숨겨서 최상위끼리만 자리를 고르게 함
+      st.parent = st.item.dataset.parent || null;
+      if (!st.parent) list.classList.add('tops-only');
+      document.body.classList.add('fold-dragging');
+    };
+    // 같이 순서를 바꿀 무리: 최상위끼리, 또는 같은 위 폴더의 하위 폴더끼리
+    const peers = () => folds().filter((x) => (x.dataset.parent || null) === st.parent);
+    list.addEventListener('pointerdown', (e) => {
+      if (e.button > 0 || settling) return;
+      const grip = e.target.closest('[data-grip]');
+      const item = e.target.closest('.fold[data-fid]');
+      if (!item || e.target.closest('[data-fedit]')) return;
+      if (!grip && e.pointerType === 'touch') return;
+      st = { item, pid: e.pointerId, x: e.clientX, y: e.clientY, on: false };
+      if (grip) { e.preventDefault(); lift(e); }
     });
     list.addEventListener('pointermove', (e) => {
       if (!st || e.pointerId !== st.pid) return;
-      const others = $$('.fold[data-fid]', list).filter((x) => x !== st.item);
-      if (!others.length) return;
-      const before = others.find((it) => { const r = it.getBoundingClientRect(); return e.clientY < r.top + r.height / 2; });
-      if (before) { if (st.item.nextElementSibling !== before) list.insertBefore(st.item, before); }
-      else { const last = others[others.length - 1]; if (last.nextElementSibling !== st.item) last.after(st.item); }
+      if (!st.on) { if (Math.hypot(e.clientX - st.x, e.clientY - st.y) < 5) return; lift(e); }
+      st.ghost.style.transform = `translate(${e.clientX - st.dx - parseFloat(st.ghost.style.left)}px,${e.clientY - st.dy - parseFloat(st.ghost.style.top)}px) scale(1.02)`;
+      // 포인터 위치를 목록 안 좌표로 바꿔서, 움직이는 중인 줄의 transform에 휘둘리지 않게 비교
       const lr = list.getBoundingClientRect();
+      const y = e.clientY - lr.top - list.clientTop + list.scrollTop;
+      const all = peers(), others = all.filter((x) => x !== st.item);
+      if (others.length) {
+        const before = others.find((it) => y < it.offsetTop + it.offsetHeight / 2);
+        const last = others[others.length - 1];
+        if (all.indexOf(st.item) !== (before ? others.indexOf(before) : others.length)) {
+          const tops = new Map(all.map((el) => [el, el.offsetTop]));
+          if (before) list.insertBefore(st.item, before); else last.after(st.item);
+          slide(others, tops);
+        }
+      }
       if (e.clientY < lr.top + 24) list.scrollTop -= 8; else if (e.clientY > lr.bottom - 24) list.scrollTop += 8;
     });
     const end = (e) => {
       if (!st || e.pointerId !== st.pid) return;
-      const { item } = st; st = null;
-      item.classList.remove('lifting');
-      list.classList.remove('sorting');
-      const ids = $$('.fold[data-fid]', list).map((x) => x.dataset.fid);
-      if (ids.join() === S.fdata.folders.map((f) => f.id).join()) return;
-      const byId = new Map(S.fdata.folders.map((f) => [f.id, f]));
-      S.fdata.folders = ids.map((id) => byId.get(id)).filter(Boolean);
-      saveF();
-      renderAll();
+      const ids = st.on ? peers().map((x) => x.dataset.fid) : null;
+      const { item, on, ghost } = st; st = null;
+      if (!on) return;
+      swallowClick = true; setTimeout(() => { swallowClick = false; }, 0);
+      settling = true;
+      // 사본이 빈 자리로 내려앉은 뒤 정리
+      const r = item.getBoundingClientRect();
+      ghost.style.transition = 'transform .16s cubic-bezier(.2,.8,.2,1), opacity .16s';
+      ghost.style.transform = `translate(${r.left - parseFloat(ghost.style.left)}px,${r.top - parseFloat(ghost.style.top)}px)`;
+      ghost.style.opacity = '1';
+      setTimeout(() => {
+        ghost.remove();
+        item.classList.remove('slot');
+        list.classList.remove('sorting', 'tops-only');
+        document.body.classList.remove('fold-dragging');
+        folds().forEach((el) => { el.style.transition = el.style.transform = ''; });
+        settling = false;
+        if (reorderPeers(ids)) saveF();
+        renderAll();
+      }, 170);
     };
     list.addEventListener('pointerup', end);
     list.addEventListener('pointercancel', end);
+    // 끌기를 마친 뒤 따라오는 클릭이 폴더를 여는 것을 막음
+    list.addEventListener('click', (e) => { if (swallowClick) { swallowClick = false; e.stopImmediatePropagation(); e.preventDefault(); } }, true);
   }
 
   function moveMenu(anchor) {
-    const items = S.fdata.folders.map((f) => `<button class="mi" data-pick="${f.id}"><span class="dot" style="--c:${esc(f.color)}"></span><span class="lbl2">${esc(f.name)}</span></button>`).join('');
+    const items = treeOrder().map((f) => `<button class="mi ${f.parent ? 'sub' : ''}" data-pick="${f.id}">${ic('folder', 16)}<span class="lbl2">${esc(f.name)}</span></button>`).join('');
     openMenu(anchor, `<div class="mh">폴더로 이동</div>${items || '<div class="fold-hint">아직 폴더가 없어요</div>'}<div class="msep"></div><button class="mi" data-pick="__new">${ic('folderPlus', 16)}새 폴더 만들어 넣기</button>`,
       (v) => { if (v === '__new') createFolder([...S.sel]); else assignFolder([...S.sel], v); });
   }
@@ -1515,8 +1704,14 @@ input,select{font:inherit;color:inherit}
         const td = normF(await store.get('ad.f.' + tgt.key, null));
         for (const e of entries) {
           if (!e.ok || !e.folder) continue;
-          let tf = td.folders.find((f) => f.name === e.folder.name);
-          if (!tf) { tf = { id: rid(), name: e.folder.name, color: e.folder.color }; td.folders.push(tf); }
+          // 이름으로 같은 폴더를 찾고, 없으면 만듦 (하위 폴더면 위 폴더부터)
+          const ensure = (name, parent) => {
+            let tf = td.folders.find((f) => f.name === name && (f.parent || null) === (parent || null));
+            if (!tf) { tf = { id: rid(), name }; if (parent) tf.parent = parent; td.folders.push(tf); }
+            return tf;
+          };
+          const up = e.folder.parent && fget(e.folder.parent);
+          const tf = up ? ensure(e.folder.name, ensure(up.name, null).id) : ensure(e.folder.name, null);
           td.map[e.tk + '::' + e.a.name] = tf.id;
         }
         await store.set('ad.f.' + tgt.key, td);
@@ -1539,13 +1734,15 @@ input,select{font:inherit;color:inherit}
     const ok = await modal({
       icon: 'sort', title: '폴더 순서를 실제 순서에 적용',
       desc: '리스 안의 에셋 배열을 폴더 순서대로 다시 정렬해요. 폴더 밖 에셋은 맨 뒤로 가고, 같은 폴더 안에서는 기존 순서를 지켜요.',
-      body: `<div class="note">${S.fdata.folders.map((f, i) => `<span style="display:inline-flex;align-items:center;gap:6px;margin-right:10px"><b style="color:var(--ink-3)">${i + 1}</b><span class="dot" style="--c:${esc(f.color)}"></span>${esc(f.name)}</span>`).join('')}<span style="display:inline-flex;gap:6px;align-items:center"><b style="color:var(--ink-3)">${S.fdata.folders.length + 1}</b>폴더 밖</span></div>`,
+      body: `<div class="note">${treeOrder().map((f, i) => `<span style="display:inline-flex;align-items:center;gap:6px;margin-right:10px"><b style="color:var(--ink-3)">${i + 1}</b>${ic('folder', 14)}${esc(fullName(f))}</span>`).join('')}<span style="display:inline-flex;gap:6px;align-items:center"><b style="color:var(--ink-3)">${S.fdata.folders.length + 1}</b>폴더 밖</span></div>`,
       ok: '정렬하기',
     });
     if (!ok) return;
     await withBusy('order', async () => {
       const ids = folderIds();
-      const rank = (fkey) => { const fid = S.fdata.map[fkey]; const i = fid && ids.has(fid) ? S.fdata.folders.findIndex((f) => f.id === fid) : -1; return i < 0 ? S.fdata.folders.length : i; };
+      // 위 폴더 → 그 폴더에 바로 든 에셋 → 하위 폴더들 순서
+      const order = treeOrder().map((f) => f.id);
+      const rank = (fkey) => { const fid = S.fdata.map[fkey]; const i = fid && ids.has(fid) ? order.indexOf(fid) : -1; return i < 0 ? order.length : i; };
       await mutateSource(S.src, (lists) => {
         for (const k of Object.keys(lists)) {
           lists[k] = (lists[k] || []).map((t, i) => ({ t, i, r: rank(k + '::' + t[0]) })).sort((a, b) => a.r - b.r || a.i - b.i).map((x) => x.t);
@@ -1570,7 +1767,7 @@ input,select{font:inherit;color:inherit}
     const allImages = files.every((f) => /^image\//.test(f.type) || /\.(png|jpe?g|gif|webp|avif|svg|bmp)$/i.test(f.name));
     let kind = isChar ? (S.kind === 'add' || (S.kind === 'all' && !allImages) ? 'add' : 'emo') : 'mod';
     let dup = 'skip';
-    const curFolder = S.folder !== 'all' && S.folder !== 'none' ? S.folder : '';
+    const curFolder = S.folder !== 'all' ? S.folder : '';
     const urls = [];
     const shown = files.slice(0, 11);
     const thumbs = shown.map((f, i) => {
@@ -1588,7 +1785,7 @@ input,select{font:inherit;color:inherit}
           <button class="chipr ${kind === 'add' ? 'on' : ''}" data-k="add">추가 에셋</button></div></div>` : ''}
         <div><label class="lbl">폴더</label><select class="select" id="uFolder">
           <option value="">폴더 없음</option>
-          ${S.fdata.folders.map((f) => `<option value="${f.id}" ${f.id === curFolder ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}
+          ${treeOrder().map((f) => `<option value="${f.id}" ${f.id === curFolder ? 'selected' : ''}>${esc(fullName(f))}</option>`).join('')}
         </select></div>
         <div><label class="lbl" id="uDupLbl">같은 이름이 이미 있으면</label><div class="chips">
           <button class="chipr on" data-dup="skip">건너뛰기</button>
@@ -1742,7 +1939,10 @@ input,select{font:inherit;color:inherit}
           const ext = (a.ext || sniff(data, '').ext || 'png').toLowerCase();
           const dirs = [];
           if (opts.kinds && S.src.type === 'char') dirs.push(a.kind === 'emo' ? '감정' : '추가');
-          if (opts.folders) { const fid = folderOf(a, ids); const f = fid && S.fdata.folders.find((x) => x.id === fid); if (f) dirs.push(safeName(f.name)); }
+          if (opts.folders) {
+            const fid = folderOf(a, ids); const f = fid && fget(fid);
+            if (f) { const up = f.parent && fget(f.parent); if (up) dirs.push(safeName(up.name)); dirs.push(safeName(f.name)); }
+          }
           const base = [...dirs, safeName(a.name)].join('/');
           let name = `${base}.${ext}`, n = 2;
           while (used.has(name.toLowerCase())) name = `${base} (${n++}).${ext}`;
@@ -1853,7 +2053,7 @@ input,select{font:inherit;color:inherit}
     const info = media.get(a.path);
     const bits = [];
     if (S.src.type === 'char') bits.push(KIND[a.kind]);
-    if (f) bits.push(`<span style="display:inline-flex;align-items:center;gap:5px"><span class="dot" style="--c:${esc(f.color)}"></span>${esc(f.name)}</span>`);
+    if (f) bits.push(`<span style="display:inline-flex;align-items:center;gap:5px">${ic('folder', 13)}${esc(fullName(f))}</span>`);
     const ext = (a.ext || (info && info.ext) || '').toUpperCase();
     if (ext) bits.push(ext);
     if (lb.dims) bits.push(lb.dims);
@@ -1889,6 +2089,392 @@ input,select{font:inherit;color:inherit}
     renderLightboxMeta();
     const list = lbList(), i = list.indexOf(uid);
     [list[i - 1], list[i + 1]].forEach((n) => { const x = n && S.byUid.get(n); if (x) loadMedia(x.path, x.ext); });
+  }
+
+  // ---------------------------------------------------------------- asset drag
+  // 에셋 끌기: 반투명한 사본이 포인터를 따라오고, 놓일 자리에 빈 칸이 벌어짐.
+  // - 에셋 사이에 놓기 → 리스 실제 배열 순서를 바꿈 (다른 폴더 묶음 사이면 그 폴더로도 옮김)
+  // - 사이드바 폴더에 놓기 → 폴더로 옮기기 / 다른 봇·모듈에 놓기 → 그쪽으로 이동
+  // 마우스는 살짝 움직이면 시작, 터치는 길게 눌러서 시작.
+  function bindAssetDrag() {
+    const content = $('#content');
+    let st = null;
+    let swallowClick = false;
+    let raf = 0;
+
+    const clearOver = (keep) => $$('.over').forEach((x) => x !== keep && x.classList.remove('over'));
+    const noTouchScroll = (e) => { if (st && st.on) e.preventDefault(); };
+
+    // 칸이 자리를 옮길 때 원래 위치에서 새 위치로 미끄러지게 함 (화면 근처 칸만).
+    // 위치는 transform의 영향을 받지 않는 offsetLeft/Top으로 잼.
+    const snap = () => {
+      const vr = content.getBoundingClientRect();
+      const m = new Map();
+      for (const el of $$('[data-uid]:not(.dragsrc),[data-slot]', content)) {
+        const r = el.getBoundingClientRect();
+        if (r.bottom < vr.top - 200 || r.top > vr.bottom + 200) continue;
+        m.set(el, [el.offsetLeft, el.offsetTop]);
+      }
+      return m;
+    };
+    const slide = (before) => {
+      for (const [el, [x0, y0]] of before) {
+        if (!el.isConnected) continue;
+        const dx = x0 - el.offsetLeft, dy = y0 - el.offsetTop;
+        if (!dx && !dy) continue;
+        el.style.transition = 'none';
+        el.style.transform = `translate(${dx}px,${dy}px)`;
+        el.getBoundingClientRect();
+        el.style.transition = 'transform .2s cubic-bezier(.2,.8,.2,1)';
+        el.style.transform = '';
+        el._until = performance.now() + 220;
+      }
+    };
+    // 미끄러지는 중인 칸은 transform을 뺀 원래 자리로 판정 (애니메이션 중에 판정이 출렁이지 않게)
+    const homeRect = (el) => {
+      const q = el.getBoundingClientRect();
+      if (!(el._until > performance.now())) return q;
+      const m = new DOMMatrixReadOnly(getComputedStyle(el).transform);
+      return { left: q.left - m.e, right: q.right - m.e, top: q.top - m.f, bottom: q.bottom - m.f };
+    };
+    const placeSlot = (ref, after) => {
+      const s = st.slot;
+      if (after ? ref.nextElementSibling === s : ref.previousElementSibling === s) return;
+      const before = snap();
+      after ? ref.after(s) : ref.before(s);
+      slide(before);
+    };
+    const appendSlot = (box) => {
+      const s = st.slot;
+      if (s.parentNode === box && !s.nextElementSibling) return;
+      const before = snap();
+      box.appendChild(s);
+      slide(before);
+    };
+    const dropSlot = () => {
+      if (!st.slot.isConnected) return;
+      const before = snap();
+      st.slot.remove();
+      slide(before);
+    };
+
+    const lift = (e) => {
+      const t = st.item;
+      const u = t.dataset.uid;
+      const vis = new Set(visibleAssets().map((a) => a.uid));
+      st.uids = S.sel.has(u) ? S.assets.filter((a) => S.sel.has(a.uid) && vis.has(a.uid)).map((a) => a.uid) : [u];
+      if (!st.uids.includes(u)) st.uids = [u];
+      const r = t.getBoundingClientRect();
+      const g = t.cloneNode(true);
+      g.removeAttribute('data-uid');
+      g.classList.add('drag-ghost');
+      g.classList.remove('sel');
+      if (st.uids.length > 1) g.insertAdjacentHTML('beforeend', `<span class="ghost-n">${st.uids.length}</span>`);
+      const k = t.classList.contains('tile') ? Math.min(1, 150 / r.width) : 1;
+      st.dx = e.clientX - r.left; st.dy = e.clientY - r.top; st.k = k;
+      Object.assign(g.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', transformOrigin: `${st.dx}px ${st.dy}px` });
+      document.body.appendChild(g);
+      st.ghost = g;
+      // 원래 칸 자리에 빈 칸을 두고, 끄는 에셋들은 감춤
+      const s = t.cloneNode(true);
+      s.removeAttribute('data-uid'); s.removeAttribute('title');
+      s.classList.remove('sel'); s.classList.add('slot');
+      s.dataset.slot = '1';
+      t.before(s);
+      st.slot = s;
+      const before = snap();
+      for (const x of st.uids) { const el = content.querySelector(`[data-uid="${x}"]`); if (el) el.classList.add('dragsrc'); }
+      slide(before);
+      st.on = true;
+      S.dragging = st.uids;
+      document.body.classList.add('asset-dragging');
+      window.addEventListener('touchmove', noTouchScroll, { passive: false });
+      if (e.pointerType === 'touch') navigator.vibrate?.(8);
+    };
+
+    const autoScroll = () => {
+      raf = 0;
+      if (!st || !st.on) return;
+      const r = content.getBoundingClientRect();
+      const y = st.lastY, x = st.lastX;
+      if (x < r.left || x > r.right) return;
+      const v = y < r.top + 60 ? -(r.top + 60 - y) / 4 : y > r.bottom - 60 ? (y - r.bottom + 60) / 4 : 0;
+      if (v) { content.scrollTop += Math.max(-18, Math.min(18, v)); raf = requestAnimationFrame(autoScroll); }
+    };
+
+    const track = (e) => {
+      st.lastX = e.clientX; st.lastY = e.clientY;
+      st.ghost.style.transform = `translate(${e.clientX - st.dx - parseFloat(st.ghost.style.left)}px,${e.clientY - st.dy - parseFloat(st.ghost.style.top)}px) scale(${st.k * 1.02})`;
+      if (!raf) raf = requestAnimationFrame(autoScroll);
+      const hit = document.elementFromPoint(e.clientX, e.clientY);
+      st.target = null;
+      if (!hit) { clearOver(); return; }
+      // 봇/모듈 탭에 올리면 탭 전환
+      const tab = hit.closest('#srcTabs [data-tab]');
+      if (tab && S.prefs.srcTab !== tab.dataset.tab) { S.prefs.srcTab = tab.dataset.tab; renderSources(); }
+      const src = hit.closest('#srcList [data-src]');
+      if (src) {
+        if (S.src && src.dataset.src !== S.src.key) { st.target = { type: 'src', key: src.dataset.src }; clearOver(src); src.classList.add('over'); }
+        else clearOver();
+        return;
+      }
+      const fold = hit.closest('#folderList [data-drop]');
+      if (fold) { st.target = { type: 'folder', id: fold.dataset.drop }; clearOver(fold); fold.classList.add('over'); dropSlot(); return; }
+      clearOver();
+      if (!content.contains(hit)) return;
+      const grp = hit.closest('[data-drop]');
+      if (!grp) return;
+      const box = grp.querySelector('.grid,.list');
+      if (!box || grp.classList.contains('collapsed')) {
+        dropSlot();
+        grp.classList.add('over');
+        st.target = { type: 'folder', id: grp.dataset.drop };
+        return;
+      }
+      st.target = { type: 'slot' };
+      // 묶음 머리 위면 맨 앞으로
+      if (hit.closest('.grp-h')) {
+        const first = box.querySelector('[data-uid]:not(.dragsrc),[data-slot]');
+        if (first && first !== st.slot) placeSlot(first, false); else if (!first) appendSlot(box);
+        return;
+      }
+      const cells = $$(':scope>[data-uid]:not(.dragsrc),:scope>[data-slot]', box);
+      const x = e.clientX, y = e.clientY;
+      let over = null;
+      for (const el of cells) { const q = homeRect(el); if (x >= q.left && x < q.right && y >= q.top && y < q.bottom) { over = el; break; } }
+      if (!over) {
+        // 칸 사이 틈은 그대로 두고, 마지막 칸 뒤의 빈 곳일 때만 맨 뒤로
+        const last = cells[cells.length - 1];
+        const q = last && homeRect(last);
+        if (!q || y >= q.bottom || (y >= q.top && x >= q.right)) { if (last !== st.slot) appendSlot(box); }
+        return;
+      }
+      if (over === st.slot) return;
+      // 다른 칸에 들어가면 그 칸과 자리를 맞바꿈. 바뀐 뒤에는 포인터가 빈 칸 위에 있으므로 다시 흔들리지 않음.
+      // 다른 묶음에서 처음 들어올 때만 칸의 앞/뒤 절반으로 판단.
+      if (st.slot.parentNode === box) {
+        placeSlot(over, cells.indexOf(st.slot) < cells.indexOf(over));
+      } else {
+        const q = homeRect(over);
+        placeSlot(over, box.classList.contains('grid') ? x > (q.left + q.right) / 2 : y > (q.top + q.bottom) / 2);
+      }
+    };
+
+    const cleanup = (cur) => {
+      cur.ghost.remove();
+      cur.slot.remove();
+      $$('.dragsrc', content).forEach((x) => x.classList.remove('dragsrc'));
+      $$('[data-uid]', content).forEach((x) => { x.style.transition = x.style.transform = ''; });
+      clearOver();
+      document.body.classList.remove('asset-dragging');
+      window.removeEventListener('touchmove', noTouchScroll);
+      S.dragging = null;
+    };
+
+    const finish = async (e, cancel) => {
+      if (!st) return;
+      clearTimeout(st.timer);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      const cur = st; st = null;
+      if (!cur.on) return;
+      swallowClick = true; setTimeout(() => { swallowClick = false; }, 0);
+      const tg = cancel ? null : cur.target;
+      if (tg && tg.type === 'slot' && cur.slot.isConnected) {
+        const gid = cur.slot.closest('[data-drop]')?.dataset.drop;
+        const plan = reorderPlan(cur.uids, cur.slot);
+        // 빈 칸 자리에 에셋들을 넣어 둔 채로 저장 (저장이 끝나면 다시 그림)
+        for (const u of cur.uids) { const el = content.querySelector(`[data-uid="${u}"]`); if (el) cur.slot.before(el); }
+        cleanup(cur);
+        await commitDrop(cur.uids, gid, plan);
+        return;
+      }
+      cleanup(cur);
+      if (tg && tg.type === 'folder') assignFolder(cur.uids, tg.id);
+      else if (tg && tg.type === 'src') doCopy({ uids: cur.uids, target: tg.key, move: true });
+    };
+    const onMove = (e) => {
+      if (!st || e.pointerId !== st.pid) return;
+      if (!st.on) {
+        const d = Math.hypot(e.clientX - st.x, e.clientY - st.y);
+        if (st.touch) { if (d > 8) finish(e, true); return; }
+        if (d < 5) return;
+        lift(e);
+      }
+      track(e);
+    };
+    const onUp = (e) => { if (st && e.pointerId === st.pid) finish(e, false); };
+    const onCancel = (e) => { if (st && e.pointerId === st.pid) finish(e, true); };
+
+    content.addEventListener('pointerdown', (e) => {
+      if (st || e.button > 0 || S.busy || modalOpen) return;
+      const t = e.target.closest('[data-uid]');
+      if (!t || t.classList.contains('dragsrc')) return;
+      st = { item: t, pid: e.pointerId, x: e.clientX, y: e.clientY, on: false, touch: e.pointerType === 'touch' };
+      if (st.touch) st.timer = setTimeout(() => { if (st && !st.on) { lift(e); track(e); } }, 380);
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onCancel);
+    });
+    // 끌기를 마친 뒤 따라오는 클릭이 선택을 바꾸지 않게 막음
+    content.addEventListener('click', (e) => { if (swallowClick) { swallowClick = false; e.stopImmediatePropagation(); e.preventDefault(); } }, true);
+    // 길게 눌렀을 때 뜨는 메뉴 막기
+    content.addEventListener('contextmenu', (e) => { if (st || S.dragging) e.preventDefault(); });
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && st && st.on) { e.stopImmediatePropagation(); finish(e, true); } }, true);
+  }
+
+  // 빈 칸 위치를 보고, 종류(감정/추가/모듈)별 배열의 새 순서를 계산.
+  // 화면에 안 보이는 에셋(검색에서 빠진 것, 접힌 폴더 등)은 원래 자리를 지킴.
+  function reorderPlan(uids, slot) {
+    const seq = $$('[data-uid]:not(.dragsrc),[data-slot]', $('#content'));
+    const at = seq.indexOf(slot);
+    const dragged = uids.map((u) => S.byUid.get(u)).filter(Boolean);
+    const plan = {};
+    for (const kind of ['emo', 'add', 'mod']) {
+      const mine = dragged.filter((a) => a.kind === kind).sort((a, b) => a.idx - b.idx);
+      if (!mine.length) continue;
+      const moving = new Set(mine.map((a) => a.idx));
+      const total = (S.src.lists[kind] || []).length;
+      const rest = [];
+      for (let i = 0; i < total; i++) if (!moving.has(i)) rest.push(i);
+      const idxOf = (el) => { const a = el.dataset.uid && S.byUid.get(el.dataset.uid); return a && a.kind === kind && !moving.has(a.idx) ? a.idx : -1; };
+      let pos = -1;
+      for (let i = at + 1; i < seq.length && pos < 0; i++) { const x = idxOf(seq[i]); if (x >= 0) pos = rest.indexOf(x); }
+      for (let i = at - 1; i >= 0 && pos < 0; i--) { const x = idxOf(seq[i]); if (x >= 0) pos = rest.indexOf(x) + 1; }
+      if (pos < 0) pos = rest.filter((i) => i < mine[0].idx).length;
+      const order = [...rest.slice(0, pos), ...mine.map((a) => a.idx), ...rest.slice(pos)];
+      if (order.some((v, i) => v !== i)) plan[kind] = order;
+    }
+    return plan;
+  }
+
+  async function commitDrop(uids, gid, plan) {
+    // 다른 폴더 묶음 사이에 놓았으면 그 폴더로 옮김
+    const moved = gid ? uids.filter((u) => { const a = S.byUid.get(u); return a && (folderOf(a) || 'none') !== gid; }) : [];
+    if (moved.length) { assignFolder(moved, gid, true); await saveF(); }
+    const kinds = Object.keys(plan);
+    if (!kinds.length) { renderAll(); return; }
+    // 배열 순서가 바뀌면 uid(종류#번호)도 바뀌므로, 선택은 이름·경로로 다시 찾아 둠
+    const key = (a) => a.kind + '\n' + a.name + '\n' + a.path;
+    const selKeys = new Set([...S.sel].map((u) => S.byUid.get(u)).filter(Boolean).map(key));
+    const snap = Object.fromEntries(kinds.map((k) => [k, S.src.lists[k].map((t) => t[0] + '\n' + t[1]).join('\n')]));
+    await withBusy('순서 바꾸는 중', async () => {
+      await mutateSource(S.src, (lists) => {
+        for (const k of kinds) {
+          const arr = lists[k] || [];
+          if (arr.map((t) => t[0] + '\n' + t[1]).join('\n') !== snap[k]) throw new Error('에셋 목록이 바뀌었어요. 새로고침 후 다시 시도해 주세요.');
+          lists[k] = plan[k].map((i) => arr[i]);
+        }
+      });
+    });
+    buildAssets();
+    S.sel = new Set(S.assets.filter((a) => selKeys.has(key(a))).map((a) => a.uid));
+    S.anchor = null;
+    renderAll();
+  }
+
+  // ---------------------------------------------------------------- folder sections (main)
+  // 메인 화면의 폴더 묶음도 머리 줄을 끌어서 순서를 바꿈.
+  // 끄는 동안에는 모든 폴더 묶음을 접힌 모양으로 보여 줘서, 사이드바처럼 한눈에 자리를 고를 수 있게 함.
+  function bindGroupSort() {
+    const content = $('#content');
+    let st = null;
+    let swallowClick = false;
+    let raf = 0;
+    // 같이 순서를 바꿀 무리: 같은 곳(메인 목록, 또는 한 폴더의 하위 폴더 칸)에 있는 폴더 묶음끼리
+    const secs = () => $$(':scope>.grp.boxed', st ? st.box : content);
+    const slide = (els, tops) => {
+      for (const el of els) {
+        const d = tops.get(el) - el.offsetTop;
+        if (!d) continue;
+        el.style.transition = 'none';
+        el.style.transform = `translateY(${d}px)`;
+        el.getBoundingClientRect();
+        el.style.transition = 'transform .2s cubic-bezier(.2,.8,.2,1)';
+        el.style.transform = '';
+      }
+    };
+    const lift = (e) => {
+      const sec = st.sec;
+      // 모두 접힌 모양으로 바꾸되, 잡은 머리 줄은 포인터 아래에 그대로 둠
+      const before = sec.getBoundingClientRect().top;
+      st.box.classList.add('grp-sorting');
+      content.scrollTop += sec.getBoundingClientRect().top - before;
+      const r = sec.getBoundingClientRect();
+      const g = sec.cloneNode(false);
+      g.appendChild(sec.querySelector('.grp-h').cloneNode(true));
+      g.removeAttribute('data-drop');
+      g.classList.add('grp-ghost', 'collapsed');
+      g.classList.remove('slot');
+      Object.assign(g.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px' });
+      document.body.appendChild(g);
+      sec.classList.add('slot');
+      st.on = true; st.ghost = g; st.dx = e.clientX - r.left; st.dy = e.clientY - r.top;
+      document.body.classList.add('fold-dragging');
+    };
+    const autoScroll = () => {
+      raf = 0;
+      if (!st || !st.on) return;
+      const r = content.getBoundingClientRect(), y = st.lastY;
+      const v = y < r.top + 50 ? -(r.top + 50 - y) / 3 : y > r.bottom - 50 ? (y - r.bottom + 50) / 3 : 0;
+      if (v) { content.scrollTop += Math.max(-16, Math.min(16, v)); move(); raf = requestAnimationFrame(autoScroll); }
+    };
+    // 포인터 위치를 목록 안 좌표로 바꿔서, 미끄러지는 중인 묶음의 transform에 휘둘리지 않게 비교
+    const move = () => {
+      const cr = content.getBoundingClientRect();
+      const y = st.lastY - cr.top - content.clientTop + content.scrollTop;
+      const all = secs(), others = all.filter((x) => x !== st.sec);
+      if (!others.length) return;
+      const base = others[0].offsetParent === content ? 0 : content.offsetTop;
+      const before = others.find((it) => y < it.offsetTop - base + it.offsetHeight / 2);
+      const last = others[others.length - 1];
+      if (before ? st.sec.nextElementSibling === before : last.nextElementSibling === st.sec) return;
+      const tops = new Map(all.map((el) => [el, el.offsetTop]));
+      if (before) before.before(st.sec); else last.after(st.sec);
+      slide(others, tops);
+    };
+    content.addEventListener('pointerdown', (e) => {
+      if (st || e.button > 0 || S.busy) return;
+      const head = e.target.closest('.grp.boxed>.grp-h');
+      if (!head || e.target.closest('button:not([data-collapse])')) return;
+      if (e.pointerType === 'touch') return;
+      st = { sec: head.parentNode, box: head.parentNode.parentNode, pid: e.pointerId, x: e.clientX, y: e.clientY, on: false };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    });
+    const onMove = (e) => {
+      if (!st || e.pointerId !== st.pid) return;
+      if (!st.on) { if (Math.hypot(e.clientX - st.x, e.clientY - st.y) < 5) return; lift(e); }
+      st.lastY = e.clientY;
+      st.ghost.style.transform = `translate(${e.clientX - st.dx - parseFloat(st.ghost.style.left)}px,${e.clientY - st.dy - parseFloat(st.ghost.style.top)}px) scale(1.01)`;
+      move();
+      if (!raf) raf = requestAnimationFrame(autoScroll);
+    };
+    const onUp = (e) => {
+      if (!st || e.pointerId !== st.pid) return;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      const ids = st.on ? secs().map((x) => x.dataset.drop) : null;
+      const { sec, box, on, ghost } = st; st = null;
+      if (!on) return;
+      swallowClick = true; setTimeout(() => { swallowClick = false; }, 0);
+      ghost.remove();
+      sec.classList.remove('slot');
+      document.body.classList.remove('fold-dragging');
+      $$(':scope>.grp.boxed', box).forEach((el) => { el.style.transition = el.style.transform = ''; });
+      const fid = sec.dataset.drop;
+      // 다시 펼친 뒤에도 놓은 폴더가 같은 자리에 보이도록 스크롤을 맞춤
+      const at = sec.getBoundingClientRect().top;
+      box.classList.remove('grp-sorting');
+      if (reorderPeers(ids)) { saveF(); renderAll(); }
+      const now = content.querySelector(`.grp[data-drop="${fid}"]`);
+      if (now) content.scrollTop += now.getBoundingClientRect().top - at;
+    };
+    // 끌기를 마친 뒤 따라오는 클릭이 폴더를 접지 않게 막음
+    content.addEventListener('click', (e) => { if (swallowClick) { swallowClick = false; e.stopImmediatePropagation(); e.preventDefault(); } }, true);
   }
 
   // ---------------------------------------------------------------- side (mobile)
@@ -1949,7 +2535,8 @@ input,select{font:inherit;color:inherit}
         list.forEach((u) => (all ? S.sel.delete(u) : S.sel.add(u)));
         refreshSelection(); return;
       }
-      const col = e.target.closest('[data-collapse]');
+      // 접기: 화살표뿐 아니라 묶음 머리 줄 아무 곳이나 눌러도 됨 (안의 다른 버튼은 제외)
+      const col = e.target.closest('[data-collapse]') || (!e.target.closest('button') && e.target.closest('.grp-h')?.querySelector('[data-collapse]'));
       if (col) { const id = col.dataset.collapse; S.fdata.collapsed[id] = !S.fdata.collapsed[id]; saveF(); renderContent(); return; }
       const t = e.target.closest('[data-uid]');
       if (t) toggleUid(t.dataset.uid, e);
@@ -1961,38 +2548,8 @@ input,select{font:inherit;color:inherit}
       const t = e.target.closest('[data-uid]'); if (t) openLightbox(t.dataset.uid);
     });
 
-    // drag & drop
-    content.addEventListener('dragstart', (e) => {
-      const t = e.target.closest('[data-uid]'); if (!t) return;
-      const u = t.dataset.uid;
-      S.dragging = S.sel.has(u) ? [...S.sel] : [u];
-      e.dataTransfer.effectAllowed = 'move';
-      try { e.dataTransfer.setData('text/plain', S.dragging.length + ' assets'); } catch {}
-      const ghost = document.createElement('div');
-      ghost.style.cssText = 'position:fixed;top:-100px;left:-100px;padding:8px 13px;border-radius:11px;background:var(--accent);color:var(--accent-ink);font:700 13px Pretendard,system-ui;box-shadow:0 10px 24px -8px rgba(0,0,0,.4)';
-      ghost.textContent = `에셋 ${S.dragging.length}개`;
-      document.body.appendChild(ghost);
-      try { e.dataTransfer.setDragImage(ghost, 10, 10); } catch {}
-      setTimeout(() => ghost.remove(), 0);
-    });
-    content.addEventListener('dragend', () => { S.dragging = null; $$('.over').forEach((x) => x.classList.remove('over')); });
-    const dropHandlers = (root) => {
-      root.addEventListener('dragover', (e) => {
-        if (!S.dragging) return;
-        const d = e.target.closest('[data-drop]'); if (!d) return;
-        e.preventDefault(); e.dataTransfer.dropEffect = 'move';
-        $$('.over').forEach((x) => x !== d && x.classList.remove('over'));
-        d.classList.add('over');
-      });
-      root.addEventListener('dragleave', (e) => { const d = e.target.closest('[data-drop]'); if (d && !d.contains(e.relatedTarget)) d.classList.remove('over'); });
-      root.addEventListener('drop', (e) => {
-        const d = e.target.closest('[data-drop]'); if (!d || !S.dragging) return;
-        e.preventDefault(); d.classList.remove('over');
-        const uids = S.dragging; S.dragging = null;
-        assignFolder(uids, d.dataset.drop);
-      });
-    };
-    dropHandlers(content); dropHandlers($('#folderList'));
+    bindAssetDrag();
+    bindGroupSort();
 
     // 에셋 추가: 버튼 또는 바깥 파일을 화면으로 끌어다 놓기
     $('#addAsset').addEventListener('click', () => $('#fileIn').click());
@@ -2003,7 +2560,7 @@ input,select{font:inherit;color:inherit}
       if (!hasFiles(e) || !S.src) return;
       e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
       if (!dz.classList.contains('show')) {
-        $('#dzTarget').textContent = `‘${S.src.name}’${S.folder !== 'all' && S.folder !== 'none' ? ` · ${(S.fdata.folders.find((f) => f.id === S.folder) || {}).name || ''} 폴더` : ''}`;
+        $('#dzTarget').textContent = `‘${S.src.name}’${S.folder !== 'all' ? ` · ${fullName(fget(S.folder))} 폴더` : ''}`;
         dz.classList.add('show');
       }
     });
@@ -2012,31 +2569,6 @@ input,select{font:inherit;color:inherit}
       if (!hasFiles(e)) return;
       e.preventDefault(); dz.classList.remove('show');
       if (S.src && e.dataTransfer.files.length) addFiles([...e.dataTransfer.files]);
-    });
-
-    // 사이드바의 다른 봇·모듈로 끌어다 놓으면 이동
-    const srcList = $('#srcList');
-    const srcTarget = (e) => { const b = e.target.closest('[data-src]'); return b && S.src && b.dataset.src !== S.src.key ? b : null; };
-    srcList.addEventListener('dragover', (e) => {
-      if (!S.dragging) return;
-      const b = srcTarget(e); if (!b) return;
-      e.preventDefault(); e.dataTransfer.dropEffect = 'move';
-      $$('.over').forEach((x) => x !== b && x.classList.remove('over'));
-      b.classList.add('over');
-    });
-    srcList.addEventListener('dragleave', (e) => { const b = e.target.closest('[data-src]'); if (b && !b.contains(e.relatedTarget)) b.classList.remove('over'); });
-    srcList.addEventListener('drop', (e) => {
-      const b = srcTarget(e); if (!b || !S.dragging) return;
-      e.preventDefault(); b.classList.remove('over');
-      const uids = S.dragging; S.dragging = null;
-      doCopy({ uids, target: b.dataset.src, move: true });
-    });
-    // 끌고 있는 동안 봇/모듈 탭 위에 올리면 탭 전환
-    $('#srcTabs').addEventListener('dragover', (e) => {
-      if (!S.dragging) return;
-      const t = e.target.closest('[data-tab]'); if (!t) return;
-      e.preventDefault();
-      if (S.prefs.srcTab !== t.dataset.tab) { S.prefs.srcTab = t.dataset.tab; renderSources(); }
     });
 
     $('#actionbar').addEventListener('click', (e) => {
