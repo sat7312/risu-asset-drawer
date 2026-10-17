@@ -1,7 +1,7 @@
 //@name asset_drawer
 //@display-name Asset Drawer
 //@api 3.0
-//@version 1.0.0
+//@version 1.1.0
 //@update-url https://raw.githubusercontent.com/sat7312/risu-asset-drawer/main/asset_drawer.js
 //@link https://github.com/sat7312/risu-asset-drawer GitHub
 
